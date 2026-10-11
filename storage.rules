@@ -1,0 +1,29 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function notSuspended() {
+      return request.auth.token.suspended != true;
+    }
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid && notSuspended();
+    }
+
+    // الصور الشخصية: يقرأها المسجَّلون، ويكتبها صاحبها فقط، صور فقط وبحجم محدود
+    match /avatars/{uid}/{file} {
+      allow read: if signedIn();
+      allow create, update: if isOwner(uid)
+        && request.resource.size < 2 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png|webp)');
+      allow delete: if isOwner(uid);
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

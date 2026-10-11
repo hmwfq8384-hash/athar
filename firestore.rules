@@ -1,0 +1,105 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===== دوال مساعدة =====
+    function signedIn() {
+      return request.auth != null;
+    }
+    function isOwner(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+    // الصلاحيات الإدارية تأتي من Custom Claims فقط، ولا تُقرأ من وثائق يعدّلها المستخدم
+    function isAdmin() {
+      return signedIn() && request.auth.token.admin == true;
+    }
+    function isSuspended() {
+      return signedIn() && request.auth.token.suspended == true;
+    }
+    function active() {
+      return signedIn() && !isSuspended();
+    }
+    function onlyChanges(allowed) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(allowed);
+    }
+    function validUsername(u) {
+      return u is string && u.matches('^[a-z][a-z0-9_]{2,19}$');
+    }
+    function validPrivacy(p) {
+      return p is map
+        && p.keys().hasOnly(['isPrivate', 'showHifz', 'showAchievements', 'showFollowLists', 'allowPartnerRequests'])
+        && p.isPrivate is bool
+        && p.showHifz is bool
+        && p.showAchievements is bool
+        && p.showFollowLists is bool
+        && p.allowPartnerRequests is bool;
+    }
+    function validPhoto(v) {
+      // https في الإنتاج؛ واستثناء المحاكي المحلي (127.0.0.1/localhost) لرفع الصور أثناء التطوير
+      return v == null || (v is string && v.size() <= 600
+        && (v.matches('^https://.*') || v.matches('^http://(127\\.0\\.0\\.1|localhost):[0-9]+/.*')));
+    }
+
+    // ===== حجز أسماء المستخدمين =====
+    // القراءة بالاسم فقط (get) للتحقق من التوفر؛ لا قائمة. الحجز لا يتم إلا مع إنشاء ملف المستخدم نفسه في الدفعة ذاتها.
+    match /usernames/{username} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if active()
+        && validUsername(username)
+        && request.resource.data.keys().hasOnly(['uid', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.username == username;
+      allow update, delete: if false;
+    }
+
+    // ===== المستخدمون =====
+    match /users/{uid} {
+      allow read: if signedIn();
+
+      allow create: if isOwner(uid) && active()
+        && request.resource.data.keys().hasOnly([
+          'uid', 'displayName', 'username', 'photoURL', 'bio', 'joinedAt',
+          'postsCount', 'reactionsReceived', 'followersCount', 'followingCount', 'privacy'
+        ])
+        && request.resource.data.uid == uid
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.trim().size() >= 2
+        && request.resource.data.displayName.size() <= 40
+        && validUsername(request.resource.data.username)
+        && validPhoto(request.resource.data.photoURL)
+        && request.resource.data.bio == ''
+        && request.resource.data.joinedAt == request.time
+        && request.resource.data.postsCount == 0
+        && request.resource.data.reactionsReceived == 0
+        && request.resource.data.followersCount == 0
+        && request.resource.data.followingCount == 0
+        && validPrivacy(request.resource.data.privacy)
+        // اسم المستخدم يجب أن يُحجز لهذا المستخدم في الدفعة نفسها
+        && existsAfter(/databases/$(database)/documents/usernames/$(request.resource.data.username))
+        && getAfter(/databases/$(database)/documents/usernames/$(request.resource.data.username)).data.uid == uid;
+
+      // العدادات والاسم المستخدم وتاريخ الانضمام لا يعدّلها العميل أبدًا
+      allow update: if isOwner(uid) && active()
+        && onlyChanges(['displayName', 'bio', 'photoURL', 'privacy', 'updatedAt'])
+        && request.resource.data.displayName is string
+        && request.resource.data.displayName.trim().size() >= 2
+        && request.resource.data.displayName.size() <= 40
+        && request.resource.data.bio is string
+        && request.resource.data.bio.size() <= 160
+        && validPhoto(request.resource.data.photoURL)
+        && validPrivacy(request.resource.data.privacy)
+        && (!('updatedAt' in request.resource.data) || request.resource.data.updatedAt == request.time);
+
+      // الحذف عبر الدالة الخادمية deleteAccount فقط
+      allow delete: if false;
+    }
+
+    // ===== أي مسار آخر مغلق افتراضيًا =====
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
